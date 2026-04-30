@@ -1,0 +1,2 @@
+# Warframe-Market-Searcher
+給予繁體中文使用者的WarframeMarket遍歷所有商品，並在GoogleSheet當中進行檢視的工具。
