@@ -1,9 +1,11 @@
-name: Run WFM Script (Immediate Test)
+name: Run WFM Script (12h + Immediate)
 
 on:
-  push:                     # 每次有 commit/push 到 main 分支就會觸發
+  push:                     # 每次有 commit/push 到 main 分支就會立即觸發一次
     branches:
       - main
+  schedule:                 # 每 12 小時自動執行一次 (UTC 0點、12點)
+    - cron: "0 */12 * * *"
   workflow_dispatch:        # 允許手動觸發
 
 jobs:
