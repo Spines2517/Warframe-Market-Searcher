@@ -6,6 +6,14 @@ import gspread
 from google.oauth2.service_account import Credentials
 import os
 
+def main():
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if creds_json:
+        print("✅ 成功讀到 GOOGLE_CREDENTIALS，長度:", len(creds_json))
+    else:
+        print("❌ 沒有讀到 GOOGLE_CREDENTIALS")
+
+
 def update_history(ws, hs_data, lev_price, date_time, import_data):
     # 建立商品名對應字典
     hs_dict = {name[0]: idx for idx, name in enumerate(hs_data) if name}
