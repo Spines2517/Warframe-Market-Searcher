@@ -18,6 +18,3 @@
 ## 範例試算表
 以下提供一份簡易試算表範例，供檢視輸出結果。  目前資料由程式持有者手動更新，更新頻率不定。  
 https://docs.google.com/spreadsheets/d/1TZPekd6nKtRvn-XKJZZuaH5CjNNGzfw1nH9nnqYwtzo/edit?usp=sharing
-
-## 範例Colab程式碼(僅供檢視)
-https://colab.research.google.com/drive/1bzPX7B8Uh3oAIKGXdaowPGcy7UxYWbDT?usp=sharing
