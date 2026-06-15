@@ -5,13 +5,12 @@ import json
 import gspread
 from google.oauth2.service_account import Credentials
 import os
+creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+if creds_json:
+    print("✅ 成功讀到 GOOGLE_CREDENTIALS，長度:", len(creds_json))
+else:
+    print("❌ 沒有讀到 GOOGLE_CREDENTIALS")
 
-def main():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if creds_json:
-        print("✅ 成功讀到 GOOGLE_CREDENTIALS，長度:", len(creds_json))
-    else:
-        print("❌ 沒有讀到 GOOGLE_CREDENTIALS")
 
 
 def update_history(ws, hs_data, lev_price, date_time, import_data):
