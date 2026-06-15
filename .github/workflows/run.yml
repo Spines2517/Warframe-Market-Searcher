@@ -1,9 +1,10 @@
-name: Run WFM Script
+name: Run WFM Script (Immediate Test)
 
 on:
-  schedule:
-    - cron: "20 12 * * *"   # 每天 UTC 12:13 執行一次 → 台灣時間 20:13
-  workflow_dispatch:          # 允許手動觸發
+  push:                     # 每次有 commit/push 到 main 分支就會觸發
+    branches:
+      - main
+  workflow_dispatch:        # 允許手動觸發
 
 jobs:
   run-script:
@@ -11,15 +12,20 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4   # 建議升級到 v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Debug current time
+        run: |
+          echo "Triggered at (UTC): $(date -u)"
+          echo "Triggered at (Local/Taiwan): $(date)"
 
       - name: Run script
         env:
