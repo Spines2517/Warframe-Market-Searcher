@@ -3,8 +3,6 @@ name: Run WFM_Script
 on:
   schedule:                 # 每 12 小時自動執行一次 (UTC 0點、12點 → 台灣早上8點、晚上8點)
     - cron: "0 */12 * * *"
-    # 存檔後的一分鐘測試 (假設你在 20:28 commit，這裡設 20:29 UTC+8 → 12:29 UTC)
-    - cron: "42 12 * * *"
   workflow_dispatch:        # 允許手動觸發
 
 jobs:
