@@ -1,4 +1,4 @@
-name: Run WFM Script (12h + Immediate + 1min)
+name: Run WFM_Script
 
 on:
   schedule:                 # 每 12 小時自動執行一次 (UTC 0點、12點 → 台灣早上8點、晚上8點)
