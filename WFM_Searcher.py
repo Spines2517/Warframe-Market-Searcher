@@ -11,11 +11,15 @@ def test_service_account_access():
 
     creds_dict = json.loads(creds_json)
 
-    # 指定正確的 scope
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-
+        # 指定正確的 scope
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
+
 
     try:
         # 替換成你的試算表名稱
