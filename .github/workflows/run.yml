@@ -2,7 +2,7 @@ name: Run WFM Script
 
 on:
   schedule:
-    - cron: "0 */12 * * *"   # 每 12 小時執行一次 (UTC)
+    - cron: "13 12 * * *"   # 每天 UTC 12:13 執行一次 → 台灣時間 20:13
   workflow_dispatch:          # 允許手動觸發
 
 jobs:
