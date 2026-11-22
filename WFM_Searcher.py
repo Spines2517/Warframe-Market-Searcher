@@ -12,6 +12,33 @@ if creds_json:
 else:
     print("❌ 沒有讀到 GOOGLE_CREDENTIALS")
 
+HEADERS = {
+    "User-Agent": "WFM-Searcher/1.0 (GitHub: 你的帳號)",
+    "Accept": "application/json",
+    "Language": "zh-hant",
+    "Platform": "pc",
+}
+MIN_INTERVAL = 0.35   # 約 3 req/s 以下
+_last = 0.0
+
+def get_json(url, retries=4):
+    global _last
+    for i in range(retries):
+        wait = MIN_INTERVAL - (time.time() - _last)
+        if wait > 0:
+            time.sleep(wait)
+        _last = time.time()
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        ctype = resp.headers.get("Content-Type", "")
+        if resp.status_code == 200 and "json" in ctype:
+            return resp.json()
+        print(f"[{resp.status_code}] {ctype} {url} body={resp.text[:150]!r}")
+        if resp.status_code in (403, 429, 500, 502, 503, 504):
+            time.sleep(2 ** (i + 1))   # 指數退避
+            continue
+        return None
+    return None
+
 def update_history(ws, hs_data, lev_price, date_time, import_data):
     hs_dict = {name[0]: idx for idx, name in enumerate(hs_data) if name}
     row_values = ws.row_values(1)
