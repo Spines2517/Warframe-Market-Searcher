@@ -79,8 +79,22 @@ def main():
     # 取得所有 item slug
     url_slug = "https://api.warframe.market/v2/items"
     headers_slug = {"Language": "zh-hant"}
-    resp_slug = requests.get(url_slug, headers=headers_slug)
+    resp_slug = requests.get(
+    url_slug,
+    headers={
+        "User-Agent": "WFM-Searcher/1.0",
+        "Accept": "application/json",
+        "Language": "zh-hant",
+        "Platform": "pc",
+    },
+    timeout=30,
+    )
+    print("STATUS:", resp_slug.status_code,
+      "| TYPE:", resp_slug.headers.get("Content-Type"),
+      "| BODY:", repr(resp_slug.text[:300]), flush=True)
+    resp_slug.raise_for_status()
     data_slug = resp_slug.json()
+    
 
     tz = datetime.timezone(datetime.timedelta(hours=8))  # UTC+8
     time_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
