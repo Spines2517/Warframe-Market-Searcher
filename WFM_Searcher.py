@@ -1,269 +1,238 @@
 import datetime
-import time
-import requests
 import json
-import gspread
-from google.oauth2.service_account import Credentials
 import os
+import sys
+import time
 
-creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-if creds_json:
-    print("✅ 成功讀到 GOOGLE_CREDENTIALS，長度:", len(creds_json))
-else:
-    print("❌ 沒有讀到 GOOGLE_CREDENTIALS")
+import gspread
+import requests
+from google.oauth2.service_account import Credentials
+from gspread.utils import rowcol_to_a1
 
+# ===================== 設定 =====================
+API_BASE = "https://api.warframe.market/v2"
 HEADERS = {
-    "User-Agent": "WFM-Searcher/1.0 (GitHub: 你的帳號)",
+    "User-Agent": "WFM-Searcher/1.0",
     "Accept": "application/json",
     "Language": "zh-hant",
     "Platform": "pc",
 }
-MIN_INTERVAL = 0.35   # 約 3 req/s 以下
-_last = 0.0
+MIN_INTERVAL = 0.35          # 每次請求最小間隔（秒），約 3 req/s 以下
+RETRIES = 3                  # 單一請求最多嘗試次數
+BACKOFF_BASE = 5             # 失敗後等待 5、10、20 秒
+MAX_CONSECUTIVE_FAILS = 8    # 連續失敗幾個物品就判定被擋，直接中止
+MIN_SUCCESS_RATIO = 0.8      # 成功抓到的物品比例低於此值，就不寫入任何資料
+# =================================================
 
-def get_json(url, retries=4):
-    global _last
-    for i in range(retries):
-        wait = MIN_INTERVAL - (time.time() - _last)
+session = requests.Session()
+session.headers.update(HEADERS)
+_last_request = 0.0
+
+
+def get_json(url):
+    """帶節流、重試與退避的 GET。成功回傳 dict，失敗回傳 None。"""
+    global _last_request
+    for attempt in range(RETRIES):
+        wait = MIN_INTERVAL - (time.time() - _last_request)
         if wait > 0:
             time.sleep(wait)
-        _last = time.time()
-        resp = requests.get(url, headers=HEADERS, timeout=30)
+        _last_request = time.time()
+
+        try:
+            resp = session.get(url, timeout=30)
+        except requests.RequestException as e:
+            print(f"[請求例外] {url} {e}", flush=True)
+            time.sleep(BACKOFF_BASE * 2 ** attempt)
+            continue
+
         ctype = resp.headers.get("Content-Type", "")
         if resp.status_code == 200 and "json" in ctype:
-            return resp.json()
-        print(f"[{resp.status_code}] {ctype} {url} body={resp.text[:150]!r}")
+            try:
+                return resp.json()
+            except ValueError:
+                print(f"[JSON 解析失敗] {url} body={resp.text[:150]!r}", flush=True)
+                return None
+
+        print(f"[{resp.status_code}] {ctype} {url} body={resp.text[:150]!r}", flush=True)
         if resp.status_code in (403, 429, 500, 502, 503, 504):
-            time.sleep(2 ** (i + 1))   # 指數退避
+            time.sleep(BACKOFF_BASE * 2 ** attempt)
             continue
-        return None
+        return None  # 404 等不需要重試
     return None
 
-def update_history(ws, hs_data, lev_price, date_time, import_data):
-    hs_dict = {name[0]: idx for idx, name in enumerate(hs_data) if name}
-    row_values = ws.row_values(1)
-    next_free_cell_in_row = len(row_values) + 1
-    total_cols = ws.col_count
-    if next_free_cell_in_row > total_cols:
-        ws.add_cols(next_free_cell_in_row - total_cols)
 
-    result = "".join([char for char in (ws.cell(1, next_free_cell_in_row).address) if not char.isdigit()])
-    ws.update([[date_time]], range_name=f'{result}1', value_input_option="RAW")
+def clean(x):
+    """四捨五入到小數 2 位；整數值轉成 int。"""
+    x = round(x, 2)
+    return int(x) if x == int(x) else x
 
-    final_column = [0] * len(hs_data)
-    for i, item in enumerate(import_data):
-        item_name = item[0] if item else None
-        if item_name and item_name in hs_dict:
-            index = hs_dict[item_name]
-            if lev_price[i] and lev_price[i][0] != "":
-                final_column[index] = lev_price[i][0]
-            else:
-                final_column[index] = 0
 
-    values = [[val] for val in final_column]
-    range_str = f'{result}2:{result}{len(hs_data)+1}'
-    ws.update(values, range_name=range_str, value_input_option="RAW")
+def unit_price(order):
+    return order["platinum"] / (order.get("perTrade") or 1)
+
+
+def best(orders, pick, rank=None):
+    """取得最高買價/最低賣價（每單位）。沒有符合的訂單回傳 0。"""
+    if rank is not None:
+        orders = [o for o in orders if o.get("rank") == rank]
+    return clean(pick(unit_price(o) for o in orders)) if orders else 0
+
+
+def update_history(ws, values_by_name, time_str, fill=0):
+    """在歷史表最右邊新增一欄：第 1 列寫時間，A 欄名稱對應的列寫數值。"""
+    hs_names = ws.col_values(1)[1:]  # A2:A
+    if not hs_names:
+        print(f"⚠️ 工作表 {ws.title} 的 A 欄沒有商品名，略過")
+        return
+    hs_dict = {name: idx for idx, name in enumerate(hs_names) if name}
+
+    col = len(ws.row_values(1)) + 1
+    if col > ws.col_count:
+        ws.add_cols(col - ws.col_count)
+
+    ws.update([[time_str]], range_name=rowcol_to_a1(1, col), value_input_option="RAW")
+
+    column = [fill] * len(hs_names)
+    for name, val in values_by_name.items():
+        idx = hs_dict.get(name)
+        if idx is not None:
+            column[idx] = val
+
+    range_str = f"{rowcol_to_a1(2, col)}:{rowcol_to_a1(len(hs_names) + 1, col)}"
+    ws.update([[v] for v in column], range_name=range_str, value_input_option="RAW")
+
 
 def main():
-    creds_json = os.environ["GOOGLE_CREDENTIALS"]
-    creds_dict = json.loads(creds_json)
+    started = time.time()
+
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if not creds_json:
+        sys.exit("❌ 沒有讀到 GOOGLE_CREDENTIALS")
+    print("✅ 成功讀到 GOOGLE_CREDENTIALS，長度:", len(creds_json), flush=True)
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
-
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes)
     gc = gspread.authorize(creds)
-
-    worksheet = gc.open('WFM').worksheet('匯入')
-
-    # 取得所有 item slug
-    url_slug = "https://api.warframe.market/v2/items"
-    headers_slug = {"Language": "zh-hant"}
-    resp_slug = requests.get(
-    url_slug,
-    headers={
-        "User-Agent": "WFM-Searcher/1.0",
-        "Accept": "application/json",
-        "Language": "zh-hant",
-        "Platform": "pc",
-    },
-    timeout=30,
-    )
-    print("STATUS:", resp_slug.status_code,
-      "| TYPE:", resp_slug.headers.get("Content-Type"),
-      "| BODY:", repr(resp_slug.text[:300]), flush=True)
-    resp_slug.raise_for_status()
-    data_slug = resp_slug.json()
-    
+    sh = gc.open("WFM")
 
     tz = datetime.timezone(datetime.timedelta(hours=8))  # UTC+8
     time_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-    data_list, slug_list, tags_list = [], [], []
+    # ---------- 1. 取得所有物品清單 ----------
+    data_slug = get_json(f"{API_BASE}/items")
+    if not data_slug or "data" not in data_slug:
+        sys.exit("❌ 取得物品清單失敗，中止（未修改任何表格）")
+    items = data_slug["data"]
+    print(f"物品總數: {len(items)}", flush=True)
 
-    worksheet.clear()
-    worksheet.append_row(["名稱","賣單數量", "0等最低賣價", "滿等最低賣價",
-                          "買單數量", "0等最高買價", "滿等最高買價", "標籤", time_str])
+    # ---------- 2. 逐項抓訂單（全部先存在記憶體） ----------
+    records = []
+    ok_count = 0
+    fail_count = 0
+    consecutive_fails = 0
 
-    for item in data_slug["data"]:
-        data_list.append(item["i18n"]["zh-hant"]["name"])
-        slug_list.append(item["slug"])
-        tags_list.append(item["tags"])
+    print("開始抓取商品及價格", flush=True)
+    for n, item in enumerate(items, start=1):
+        slug = item["slug"]
+        i18n = item.get("i18n", {})
+        name = (i18n.get("zh-hant") or i18n.get("en") or {}).get("name", slug)
+        tags = item.get("tags", [])
 
-    print("開始匯入商品及價格")
-    batch_size = 100
-    for start in range(0, len(slug_list), batch_size):
-        end = start + batch_size
-        batch_slugs = slug_list[start:end]
-        batch_rows = []
-
-        for idx, slug in enumerate(batch_slugs, start=start):
-            url_item = f"https://api.warframe.market/v2/orders/item/{slug}"
-            resp_item = requests.get(url_item)
-
-            if resp_item.status_code != 200:
-                print(f"跳過: {slug}, 狀態碼={resp_item.status_code}")
-                continue
-
-            try:
-                data_item = resp_item.json()
-            except Exception as e:
-                print(f"解析失敗: {slug}, 內容={resp_item.text[:100]}")
-                continue
-
-            all_orders = data_item["data"]
-
-            buy_orders = [o for o in all_orders if o["type"] == "buy" and o["user"].get("status") == "ingame"]
-            sell_orders = [o for o in all_orders if o["type"] == "sell" and o["user"].get("status") == "ingame"]
-
-            item_info = data_slug["data"][idx]
-            if "maxRank" in item_info:
-                max_rank = item_info["maxRank"]
-
-                rank0_buy = [o for o in buy_orders if o.get("rank", None) == 0]
-                rankmax_buy = [o for o in buy_orders if o.get("rank", None) == max_rank]
-                max0_buy = max(o["platinum"] / o["perTrade"] for o in rank0_buy) if rank0_buy else "0"
-                maxmax_buy = max(o["platinum"] / o["perTrade"] for o in rankmax_buy) if rankmax_buy else "0"
-
-                rank0_sell = [o for o in sell_orders if o.get("rank", None) == 0]
-                rankmax_sell = [o for o in sell_orders if o.get("rank", None) == max_rank]
-                min0_sell = min(o["platinum"] / o["perTrade"] for o in rank0_sell) if rank0_sell else "0"
-                minmax_sell = min(o["platinum"] / o["perTrade"] for o in rankmax_sell) if rankmax_sell else "0"
-
-            else:
-                max0_buy = max(o["platinum"] / o["perTrade"] for o in buy_orders) if buy_orders else "0"
-                maxmax_buy = max0_buy
-                min0_sell = min(o["platinum"] / o["perTrade"] for o in sell_orders) if sell_orders else "0"
-                minmax_sell = min0_sell
-
-            if max0_buy == "0" and maxmax_buy == "0" and min0_sell == "0" and minmax_sell == "0":
-                continue
-
-            flat_row = [data_list[idx], len(sell_orders), min0_sell, minmax_sell,
-                        len(buy_orders), max0_buy, maxmax_buy] + tags_list[idx]
-            batch_rows.append(flat_row)
-
-            time.sleep(0.1)
-
-        if batch_rows:
-            try:
-                worksheet.append_rows(batch_rows, value_input_option="RAW")
-                print(f"✅ 已寫入 {len(batch_rows)} 筆 (範圍 {start} ~ {end})")
-            except Exception as e:
-                print("❌ 寫入失敗:", e)
-
-    print("匯入商品及價格結束")
-
-    # ===== 匯入歷史價格 =====
-    print("開始匯入歷史資料庫")
-    ws1 = gc.open('WFM').worksheet('匯入')
-    ws_s0 = gc.open('WFM').worksheet('歷史賣單價格(0等)')
-    ws_sf = gc.open('WFM').worksheet('歷史賣單價格(滿等)')
-    ws_b0 = gc.open('WFM').worksheet('歷史買單價格(0等)')
-    ws_bf = gc.open('WFM').worksheet('歷史買單價格(滿等)')
-    ws_sc = gc.open('WFM').worksheet('歷史賣單數量')
-    ws_bc = gc.open('WFM').worksheet('歷史買單數量')
-    ws_sp0 = gc.open('WFM').worksheet('歷史價差(0等)')
-    ws_spf = gc.open('WFM').worksheet('歷史價差(滿等)')
-    
-    date_time = ws1.acell('I1').value  # 時間戳在第 I 欄
-    import_data = ws1.get('A2:A')      # 商品名
-    sell_count = ws1.get('B2:B')       # 賣單數量
-    lev0_sell = ws1.get('C2:C')        # 0階最低賣價
-    levf_sell = ws1.get('D2:D')        # 滿階最低賣價
-    buy_count = ws1.get('E2:E')        # 買單數量
-    lev0_buy = ws1.get('F2:F')         # 0階最高買價
-    levf_buy = ws1.get('G2:G')         # 滿階最高買價
-    
-    hs0_data = ws_s0.get('A2:A')
-    hsf_data = ws_sf.get('A2:A')
-    hb0_data = ws_b0.get('A2:A')
-    hbf_data = ws_bf.get('A2:A')
-    sc_data = ws_sc.get('A2:A')
-    bc_data = ws_bc.get('A2:A')
-    sp0_data = ws_sp0.get('A2:A')
-    spf_data = ws_spf.get('A2:A')
-    
-    def update_history(ws, hs_data, lev_price, date_time):
-        hs_dict = {name[0]: idx for idx, name in enumerate(hs_data) if name}
-        row_values = ws.row_values(1)
-        next_free_cell_in_row = len(row_values) + 1
-        total_cols = ws.col_count
-        if next_free_cell_in_row > total_cols:
-            ws.add_cols(next_free_cell_in_row - total_cols)
-        result = "".join([char for char in (ws.cell(1, next_free_cell_in_row).address) if not char.isdigit()])
-        ws.update([[date_time]], range_name=f'{result}1', value_input_option="RAW")
-    
-        final_column = [0] * len(hs_data)
-        for i, item in enumerate(import_data):
-            item_name = item[0] if item else None
-            if item_name and item_name in hs_dict:
-                index = hs_dict[item_name]
-                if lev_price[i] and lev_price[i][0] != "":
-                    final_column[index] = lev_price[i][0]
-                else:
-                    final_column[index] = 0
-    
-        values = [[val] for val in final_column]
-        range_str = f'{result}2:{result}{len(hs_data)+1}'
-        ws.update(values, range_name=range_str, value_input_option="RAW")
-    
-    # 更新八個歷史表
-    update_history(ws_s0, hs0_data, lev0_sell, date_time)
-    print(f"已寫入 {date_time} 的0等賣單價格")
-    update_history(ws_sf, hsf_data, levf_sell, date_time)
-    print(f"已寫入 {date_time} 的滿等賣單價格")
-    update_history(ws_b0, hb0_data, lev0_buy, date_time)
-    print(f"已寫入 {date_time} 的0等買單價格")
-    update_history(ws_bf, hbf_data, levf_buy, date_time)
-    print(f"已寫入 {date_time} 的滿等買單價格")
-    update_history(ws_sc, sc_data, sell_count, date_time)
-    print(f"已寫入 {date_time} 的賣單數量")
-    update_history(ws_bc, bc_data, buy_count, date_time)
-    print(f"已寫入 {date_time} 的買單數量")
-    
-    # 價差計算
-    spread0, spreadf = [], []
-    for i in range(len(import_data)):
-        if not import_data[i] or import_data[i][0].strip() == "":
-            spread0.append([""]); spreadf.append([""])
+        data_item = get_json(f"{API_BASE}/orders/item/{slug}")
+        if data_item is None or "data" not in data_item:
+            fail_count += 1
+            consecutive_fails += 1
+            if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                sys.exit(f"❌ 連續 {consecutive_fails} 個物品失敗，疑似被擋（403/429），中止。"
+                         f"尚未修改任何表格。")
             continue
-        try:
-            sell0 = int(lev0_sell[i][0]) if lev0_sell[i] and lev0_sell[i][0].isdigit() else None
-            buy0  = int(lev0_buy[i][0])  if lev0_buy[i] and lev0_buy[i][0].isdigit()  else None
-            spread0.append([str(sell0 - buy0)] if sell0 is not None and buy0 is not None else [""])
-        except Exception: spread0.append([""])
-        try:
-            sellf = int(levf_sell[i][0]) if levf_sell[i] and levf_sell[i][0].isdigit() else None
-            buyf  = int(levf_buy[i][0])  if levf_buy[i] and levf_buy[i][0].isdigit()  else None
-            spreadf.append([str(sellf - buyf)] if sellf is not None and buyf is not None else [""])
-        except Exception: spreadf.append([""])
-    
-    update_history(ws_sp0, sp0_data, spread0, date_time)
-    print(f"已寫入 {date_time} 的0等價差")
-    update_history(ws_spf, spf_data, spreadf, date_time)
-    print(f"已寫入 {date_time} 的滿等價差")
-    print("結束匯入今日歷史資料")
+
+        consecutive_fails = 0
+        ok_count += 1
+
+        orders = data_item["data"]
+        buy_orders = [o for o in orders if o["type"] == "buy" and o["user"].get("status") == "ingame"]
+        sell_orders = [o for o in orders if o["type"] == "sell" and o["user"].get("status") == "ingame"]
+
+        max_rank = item.get("maxRank")
+        if max_rank is not None:
+            max0_buy = best(buy_orders, max, 0)
+            maxmax_buy = best(buy_orders, max, max_rank)
+            min0_sell = best(sell_orders, min, 0)
+            minmax_sell = best(sell_orders, min, max_rank)
+        else:
+            max0_buy = best(buy_orders, max)
+            maxmax_buy = max0_buy
+            min0_sell = best(sell_orders, min)
+            minmax_sell = min0_sell
+
+        if max0_buy == 0 and maxmax_buy == 0 and min0_sell == 0 and minmax_sell == 0:
+            continue
+
+        records.append({
+            "name": name,
+            "sell_n": len(sell_orders), "min0_sell": min0_sell, "minmax_sell": minmax_sell,
+            "buy_n": len(buy_orders), "max0_buy": max0_buy, "maxmax_buy": maxmax_buy,
+            "tags": tags,
+        })
+
+        if n % 100 == 0:
+            print(f"進度 {n}/{len(items)}｜成功 {ok_count}｜失敗 {fail_count}｜"
+                  f"有掛單 {len(records)}｜{time.time() - started:.0f}s", flush=True)
+
+    print(f"抓取結束：成功 {ok_count}，失敗 {fail_count}，有掛單 {len(records)}", flush=True)
+
+    # ---------- 3. 資料健全性檢查：不合格就完全不寫入 ----------
+    if ok_count / len(items) < MIN_SUCCESS_RATIO or not records:
+        sys.exit(f"❌ 成功率過低（{ok_count}/{len(items)}），資料不可信，"
+                 f"中止，不寫入「匯入」表與歷史表")
+
+    # ---------- 4. 寫入「匯入」表 ----------
+    worksheet = sh.worksheet("匯入")
+    worksheet.clear()
+    header = ["名稱", "賣單數量", "0等最低賣價", "滿等最低賣價",
+              "買單數量", "0等最高買價", "滿等最高買價", "標籤", time_str]
+    rows = [[r["name"], r["sell_n"], r["min0_sell"], r["minmax_sell"],
+             r["buy_n"], r["max0_buy"], r["maxmax_buy"]] + r["tags"] for r in records]
+
+    worksheet.append_rows([header], value_input_option="RAW")
+    chunk = 500
+    for s in range(0, len(rows), chunk):
+        worksheet.append_rows(rows[s:s + chunk], value_input_option="RAW")
+        print(f"✅ 已寫入 {min(s + chunk, len(rows))}/{len(rows)} 筆", flush=True)
+    print("匯入商品及價格結束", flush=True)
+
+    # ---------- 5. 歷史資料 ----------
+    print("開始匯入歷史資料庫", flush=True)
+
+    def by_name(key):
+        return {r["name"]: r[key] for r in records}
+
+    def spread(sell_key, buy_key):
+        out = {}
+        for r in records:
+            s, b = r[sell_key], r[buy_key]
+            out[r["name"]] = clean(s - b) if s > 0 and b > 0 else ""
+        return out
+
+    history_jobs = [
+        ("歷史賣單價格(0等)", by_name("min0_sell"), 0, "0等賣單價格"),
+        ("歷史賣單價格(滿等)", by_name("minmax_sell"), 0, "滿等賣單價格"),
+        ("歷史買單價格(0等)", by_name("max0_buy"), 0, "0等買單價格"),
+        ("歷史買單價格(滿等)", by_name("maxmax_buy"), 0, "滿等買單價格"),
+        ("歷史賣單數量", by_name("sell_n"), 0, "賣單數量"),
+        ("歷史買單數量", by_name("buy_n"), 0, "買單數量"),
+        ("歷史價差(0等)", spread("min0_sell", "max0_buy"), "", "0等價差"),
+        ("歷史價差(滿等)", spread("minmax_sell", "maxmax_buy"), "", "滿等價差"),
+    ]
+
+    for sheet_name, values, fill, label in history_jobs:
+        update_history(sh.worksheet(sheet_name), values, time_str, fill=fill)
+        print(f"已寫入 {time_str} 的{label}", flush=True)
+        time.sleep(1.5)  # 避免 Google Sheets 寫入配額（每分鐘 60 次）
+
+    print(f"結束匯入今日歷史資料，總耗時 {time.time() - started:.0f}s", flush=True)
 
 
 if __name__ == "__main__":
